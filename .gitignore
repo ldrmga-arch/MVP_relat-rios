@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+venv/
+.venv/
+
+# Scripts de exploração e debug (só para desenvolvimento local)
+explorar_*.py
+debug_*.py
+testar_conexao.py
+analise_aging.py
+relatorio_*.py
+
+# OS
+.DS_Store
+Thumbs.db
