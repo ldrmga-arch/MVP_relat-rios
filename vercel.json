@@ -1,0 +1,12 @@
+{
+  "rewrites": [
+    { "source": "/pipefy", "destination": "/api/pipefy" },
+    { "source": "/pipefy/:path*", "destination": "/api/pipefy" },
+    { "source": "/omie", "destination": "/api/omie" },
+    { "source": "/omie/:path*", "destination": "/api/omie" }
+  ],
+  "functions": {
+    "api/pipefy.py": { "maxDuration": 10 },
+    "api/omie.py": { "maxDuration": 10 }
+  }
+}

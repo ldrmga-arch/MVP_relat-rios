@@ -1,23 +1,49 @@
 #!/usr/bin/env python3
 """
 BI Dashboard — MDN Porto Rico
-Instale: pip install flask
-Execute: python dashboard_app.py
-Computador : http://localhost:5000
-Celular    : http://SEU_IP:5000  (mesmo Wi-Fi)
+Rotas servidas sob o prefixo /pipefy (ver vercel.json).
+Local: python api/pipefy.py  ->  http://localhost:5000/pipefy
 """
 
-import json, threading, time, socket, os
+import json, time, os
 import urllib.request, urllib.parse
+import requests
 from datetime import datetime, timezone
 from flask import Flask, jsonify, Response, request
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ─── Configuração ─────────────────────────────────────────────────────────────
-CLIENT_ID     = "gmntttOuval2d0etI6bB0Qq5dbdB-VYXjZcQygyNF4w"
-CLIENT_SECRET = "XJPw0LVWIuouVXFBn6KmE9CCC0C8ooXMz1GgVPLJO-0"
+CLIENT_ID     = os.environ.get("PIPEFY_CLIENT_ID", "")     or os.environ.get("CLIENT_ID", "")
+CLIENT_SECRET = os.environ.get("PIPEFY_CLIENT_SECRET", "") or os.environ.get("CLIENT_SECRET", "")
 TOKEN_URL     = "https://app.pipefy.com/oauth/token"
 GRAPHQL_URL   = "https://api.pipefy.com/graphql"
-REFRESH_MIN   = 30  # atualiza do Pipefy a cada 30 minutos
+
+# ─── Cache externo (Upstash Redis REST) ───────────────────────────────────────
+# Cada chamada a /pipefy/api/data processa um "pedaço" curto (poucas páginas)
+# e guarda o progresso aqui, já que funções serverless não mantêm estado entre
+# requisições. Defina KV_REST_API_URL/KV_REST_API_TOKEN (integração Vercel KV)
+# ou UPSTASH_REDIS_REST_URL/UPSTASH_REDIS_REST_TOKEN (Upstash direto).
+REDIS_URL   = os.environ.get("KV_REST_API_URL")   or os.environ.get("UPSTASH_REDIS_REST_URL")
+REDIS_TOKEN = os.environ.get("KV_REST_API_TOKEN") or os.environ.get("UPSTASH_REDIS_REST_TOKEN")
+CHUNK_SECONDS = 8  # margem de segurança sob o timeout de 10s do plano free da Vercel
+
+def redis_get(key):
+    if not REDIS_URL:
+        return None
+    r = requests.get(f"{REDIS_URL}/get/{key}",
+                      headers={"Authorization": f"Bearer {REDIS_TOKEN}"}, timeout=10)
+    r.raise_for_status()
+    val = r.json().get("result")
+    return json.loads(val) if val else None
+
+def redis_set(key, value):
+    if not REDIS_URL:
+        return
+    requests.post(f"{REDIS_URL}/set/{key}",
+                   headers={"Authorization": f"Bearer {REDIS_TOKEN}"},
+                   data=json.dumps(value), timeout=10)
 
 # ─── Configuração dos pipes ────────────────────────────────────────────────────
 PIPES = {
@@ -176,11 +202,24 @@ PIPES = {
     },
 }
 
-# ─── Estado global por pipe ────────────────────────────────────────────────────
+# ─── Estado por pipe (persistido no Redis entre invocações) ──────────────────
 def empty_state():
-    return {"cards": [], "loading": False, "progress": 0, "last_updated": None, "error": None}
+    return {
+        "cards": [], "loading": False, "progress": 0, "last_updated": None, "error": None,
+        "_phase_idx": 0, "_cursor": None, "_partial": [],
+    }
 
-states = {k: empty_state() for k in PIPES}
+def state_key(pk):
+    return f"pipefy:{pk}:state"
+
+def load_state(pk):
+    return redis_get(state_key(pk)) or empty_state()
+
+def save_state(pk, st):
+    redis_set(state_key(pk), st)
+
+def public_view(st):
+    return {k: v for k, v in st.items() if not k.startswith("_")}
 
 # ─── API Pipefy ────────────────────────────────────────────────────────────────
 QUERY = """
@@ -252,165 +291,171 @@ def _parse_imovel(raw):
             return raw
     return raw or "—"
 
-def load_cards(pipe_key):
-    cfg   = PIPES[pipe_key]
-    state = states[pipe_key]
-    state.update({"loading": True, "progress": 0, "error": None})
+def parse_card(c, phase, cfg):
+    fields = {f["name"]: (f.get("value") or "").strip()
+              for f in c.get("fields", [])}
+
+    created = (c.get("created_at") or "")[:10]
+    updated = (c.get("updated_at")  or "")[:10]
+    due_raw = c.get("due_date") or ""
+    due     = due_raw[:10] if due_raw else ""
+
+    # Tempo preciso na fase
+    phase_ref = (c.get("started_current_phase_at") or
+                 c.get("updated_at") or "")
+    try:
+        phase_dt = datetime.fromisoformat(
+            phase_ref.replace("Z", "+00:00"))
+        delta          = datetime.now(timezone.utc) - phase_dt
+        days_in_phase  = delta.days
+        hours_in_phase = int(delta.total_seconds() / 3600)
+    except Exception:
+        days_in_phase = hours_in_phase = 0
+
+    # SLA e status
+    sla_val  = cfg["sla"].get(phase["id"])
+    sla_unit = cfg.get("sla_unit", "days")
+    time_cmp = hours_in_phase if sla_unit == "hours" else days_in_phase
+
+    if phase["done"]:
+        status       = "recusado" if phase["name"].lower().startswith("recus") else "concluido"
+        time_display = "—"
+        sla_display  = "—"
+        sla_pct      = 0
+    else:
+        if sla_val:
+            status      = "atrasado" if time_cmp > sla_val else "no_prazo"
+            sla_pct     = round(time_cmp / sla_val * 100)
+            # Display: mostra horas quando SLA da fase < 24h
+            if sla_unit == "hours" and sla_val < 24:
+                time_display = f"{hours_in_phase}h"
+                sla_display  = f"{sla_val}h"
+            else:
+                time_display = f"{days_in_phase}d"
+                sla_display  = f"{sla_val // 24 if sla_unit == 'hours' else sla_val}d"
+        else:
+            status       = "sem_prazo"
+            sla_pct      = 0
+            time_display = f"{days_in_phase}d"
+            sla_display  = "—"
+
+    # ── Status histórico (pior fase da vida do card) ──────────
+    # Usa phases_history para incluir fases já concluídas
+    hist_status = "sem_prazo"
+    for ph_hist in (c.get("phases_history") or []):
+        ph_id      = (ph_hist.get("phase") or {}).get("id", "")
+        dur_secs   = ph_hist.get("duration") or 0
+        hist_sla   = cfg["sla"].get(ph_id)
+        if not hist_sla:
+            continue
+        time_hist = dur_secs / 3600 if sla_unit == "hours" else dur_secs / 86400
+        if time_hist > hist_sla:
+            hist_status = "atrasado"
+            break
+        else:
+            if hist_status != "atrasado":
+                hist_status = "no_prazo"
+    # Fase atual (para cards ainda em andamento)
+    if not phase["done"] and status == "atrasado":
+        hist_status = "atrasado"
+    elif not phase["done"] and status == "no_prazo" and hist_status != "atrasado":
+        hist_status = "no_prazo"
+
+    return {
+        "id":            c["id"],
+        "title":         c.get("title") or "—",
+        "created_at":    created,
+        "created_month": created[:7] if created else "",
+        "updated_at":    updated,
+        "due_date":      due,
+        "phase_name":    phase["name"],
+        "phase_done":    phase["done"],
+        "days_in_phase": days_in_phase,
+        "time_display":  time_display,
+        "sla_display":   sla_display,
+        "sla_pct":       sla_pct,
+        "status":        status,
+        "hist_status":   hist_status,
+        "assignees":     [a["name"] for a in c.get("assignees", [])],
+        "imovel":        _parse_imovel(_get_field(fields, cfg["field_imovel"])) if cfg["field_imovel"] else (c.get("title") or "—"),
+        "descricao":     (_get_field(fields, cfg["field_descricao"]) or "—")[:300],
+        "solicitante":   _get_field(fields, cfg["field_solicitante"]) or "—",
+    }
+
+def process_chunk(pipe_key):
+    """Avança o carregamento do pipe por um tempo limitado (CHUNK_SECONDS) e
+    persiste o progresso no Redis. Repetidamente chamado pelo polling do
+    frontend até completar todas as fases (substitui o antigo bg_loop)."""
+    cfg = PIPES[pipe_key]
+    st  = load_state(pipe_key)
+    if not st["loading"]:
+        st = empty_state()
+        st["loading"] = True
+
+    deadline = time.time() + CHUNK_SECONDS
     try:
         token = get_token()
-        cards = []
+        phases = cfg["phases"]
+        while time.time() < deadline and st["_phase_idx"] < len(phases):
+            phase = phases[st["_phase_idx"]]
+            r  = gql(token, QUERY, {"phaseId": phase["id"], "after": st["_cursor"]})
+            pg = r["data"]["phase"]["cards"]
 
-        for phase in cfg["phases"]:
-            cursor = None
-            while True:
-                r  = gql(token, QUERY, {"phaseId": phase["id"], "after": cursor})
-                pg = r["data"]["phase"]["cards"]
+            for e in pg["edges"]:
+                st["_partial"].append(parse_card(e["node"], phase, cfg))
+            st["progress"] = len(st["_partial"])
 
-                for e in pg["edges"]:
-                    c      = e["node"]
-                    fields = {f["name"]: (f.get("value") or "").strip()
-                              for f in c.get("fields", [])}
+            if pg["pageInfo"]["hasNextPage"]:
+                st["_cursor"] = pg["pageInfo"]["endCursor"]
+            else:
+                st["_phase_idx"] += 1
+                st["_cursor"] = None
 
-                    created = (c.get("created_at") or "")[:10]
-                    updated = (c.get("updated_at")  or "")[:10]
-                    due_raw = c.get("due_date") or ""
-                    due     = due_raw[:10] if due_raw else ""
-
-                    # Tempo preciso na fase
-                    phase_ref = (c.get("started_current_phase_at") or
-                                 c.get("updated_at") or "")
-                    try:
-                        phase_dt = datetime.fromisoformat(
-                            phase_ref.replace("Z", "+00:00"))
-                        delta          = datetime.now(timezone.utc) - phase_dt
-                        days_in_phase  = delta.days
-                        hours_in_phase = int(delta.total_seconds() / 3600)
-                    except Exception:
-                        days_in_phase = hours_in_phase = 0
-
-                    # SLA e status
-                    sla_val  = cfg["sla"].get(phase["id"])
-                    sla_unit = cfg.get("sla_unit", "days")
-                    time_cmp = hours_in_phase if sla_unit == "hours" else days_in_phase
-
-                    if phase["done"]:
-                        status       = "recusado" if phase["name"].lower().startswith("recus") else "concluido"
-                        time_display = "—"
-                        sla_display  = "—"
-                        sla_pct      = 0
-                    else:
-                        if sla_val:
-                            status      = "atrasado" if time_cmp > sla_val else "no_prazo"
-                            sla_pct     = round(time_cmp / sla_val * 100)
-                            # Display: mostra horas quando SLA da fase < 24h
-                            if sla_unit == "hours" and sla_val < 24:
-                                time_display = f"{hours_in_phase}h"
-                                sla_display  = f"{sla_val}h"
-                            else:
-                                time_display = f"{days_in_phase}d"
-                                sla_display  = f"{sla_val // 24 if sla_unit == 'hours' else sla_val}d"
-                        else:
-                            status       = "sem_prazo"
-                            sla_pct      = 0
-                            time_display = f"{days_in_phase}d"
-                            sla_display  = "—"
-
-                    # ── Status histórico (pior fase da vida do card) ──────────
-                    # Usa phases_history para incluir fases já concluídas
-                    hist_status = "sem_prazo"
-                    for ph_hist in (c.get("phases_history") or []):
-                        ph_id      = (ph_hist.get("phase") or {}).get("id", "")
-                        dur_secs   = ph_hist.get("duration") or 0
-                        hist_sla   = cfg["sla"].get(ph_id)
-                        if not hist_sla:
-                            continue
-                        time_hist = dur_secs / 3600 if sla_unit == "hours" else dur_secs / 86400
-                        if time_hist > hist_sla:
-                            hist_status = "atrasado"
-                            break
-                        else:
-                            if hist_status != "atrasado":
-                                hist_status = "no_prazo"
-                    # Fase atual (para cards ainda em andamento)
-                    if not phase["done"] and status == "atrasado":
-                        hist_status = "atrasado"
-                    elif not phase["done"] and status == "no_prazo" and hist_status != "atrasado":
-                        hist_status = "no_prazo"
-
-                    cards.append({
-                        "id":            c["id"],
-                        "title":         c.get("title") or "—",
-                        "created_at":    created,
-                        "created_month": created[:7] if created else "",
-                        "updated_at":    updated,
-                        "due_date":      due,
-                        "phase_name":    phase["name"],
-                        "phase_done":    phase["done"],
-                        "days_in_phase": days_in_phase,
-                        "time_display":  time_display,
-                        "sla_display":   sla_display,
-                        "sla_pct":       sla_pct,
-                        "status":        status,
-                        "hist_status":   hist_status,
-                        "assignees":     [a["name"] for a in c.get("assignees", [])],
-                        "imovel":        _parse_imovel(_get_field(fields, cfg["field_imovel"])) if cfg["field_imovel"] else (c.get("title") or "—"),
-                        "descricao":     (_get_field(fields, cfg["field_descricao"]) or "—")[:300],
-                        "solicitante":   _get_field(fields, cfg["field_solicitante"]) or "—",
-                    })
-
-                state["progress"] = len(cards)
-                if not pg["pageInfo"]["hasNextPage"]:
-                    break
-                cursor = pg["pageInfo"]["endCursor"]
-                time.sleep(0.2)
-
-        state["cards"]        = cards
-        state["last_updated"] = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-
-        from collections import Counter
-        por_fase    = Counter(c["phase_name"]   for c in cards)
-        por_status  = Counter(c["status"]       for c in cards)
-        por_hist    = Counter(c["hist_status"]  for c in cards)
-        sem_history = sum(1 for c in cards if c["phase_done"] and c["hist_status"] == "sem_prazo")
-        print(f"\n[OK] [{cfg['name']}] {len(cards)} cards — {state['last_updated']}")
-        print(f"     Por fase:        { dict(por_fase) }")
-        print(f"     Por status:      { dict(por_status) }")
-        print(f"     Por hist_status: { dict(por_hist) }")
-        print(f"     Done s/ history: {sem_history} (phases_history vazio p/ esses)\n")
-
+        if st["_phase_idx"] >= len(phases):
+            st["cards"]        = st["_partial"]
+            st["last_updated"] = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+            st["loading"]      = False
+            st["error"]        = None
+            st["_partial"]     = []
+            st["_phase_idx"]   = 0
+            st["_cursor"]      = None
+            print(f"[OK] [{cfg['name']}] {len(st['cards'])} cards — {st['last_updated']}")
     except Exception as ex:
-        state["error"] = str(ex)
+        st["error"]   = str(ex)
+        st["loading"] = False
         print(f"[ERRO] [{cfg['name']}] {ex}")
-    finally:
-        state["loading"] = False
 
-def bg_loop(pipe_key):
-    while True:
-        load_cards(pipe_key)
-        time.sleep(REFRESH_MIN * 60)
+    save_state(pipe_key, st)
+    return st
 
 # ─── Flask ─────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
-@app.route("/")
+@app.route("/pipefy")
 def index():
     resp = Response(HTML, content_type="text/html; charset=utf-8")
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
     resp.headers["Pragma"]        = "no-cache"
     return resp
 
-@app.route("/api/data")
+@app.route("/pipefy/api/data")
 def api_data():
     pk = request.args.get("pipe", "porto_rico")
-    if pk not in states: pk = "porto_rico"
-    return jsonify(states[pk])
+    if pk not in PIPES: pk = "porto_rico"
+    st = load_state(pk)
+    # Primeira visita (sem cache ainda) ou refresh em andamento: avança um pedaço.
+    if st["loading"] or not st["last_updated"]:
+        st = process_chunk(pk)
+    return jsonify(public_view(st))
 
-@app.route("/api/refresh", methods=["POST"])
+@app.route("/pipefy/api/refresh", methods=["POST"])
 def api_refresh():
     pk = request.args.get("pipe", "porto_rico")
-    if pk not in states: pk = "porto_rico"
-    if not states[pk]["loading"]:
-        threading.Thread(target=load_cards, args=(pk,), daemon=True).start()
+    if pk not in PIPES: pk = "porto_rico"
+    st = empty_state()
+    st["loading"] = True
+    save_state(pk, st)
+    process_chunk(pk)
     return jsonify({"ok": True})
 
 # ─── HTML Dashboard ────────────────────────────────────────────────────────────
@@ -863,8 +908,9 @@ function switchPipe(key){
 
 async function fetchData(){
   try{
-    const d = await(await fetch(`/api/data?pipe=${currentPipe}`)).json();
+    const d = await(await fetch(`/pipefy/api/data?pipe=${currentPipe}`)).json();
     const loading = d.loading;
+    pollLoading = loading;
 
     document.getElementById('lb').style.display  = loading ? 'block' : 'none';
     document.getElementById('lt').style.display  = loading ? 'block' : 'none';
@@ -893,11 +939,13 @@ async function fetchData(){
 }
 
 async function forceRefresh(){
-  await fetch(`/api/refresh?pipe=${currentPipe}`,{method:'POST'});
+  await fetch(`/pipefy/api/refresh?pipe=${currentPipe}`,{method:'POST'});
   document.getElementById('btnR').disabled = true;
+  fetchData();
 }
 
-function poll(){ fetchData(); setTimeout(poll, 15000); }
+let pollLoading = false;
+async function poll(){ await fetchData(); setTimeout(poll, pollLoading ? 500 : 15000); }
 
 // ════════════════════════════════════════════
 // FILTROS — PERÍODO (multi-select)
@@ -1269,21 +1317,10 @@ poll();
 </body>
 </html>"""
 
-# ─── Main ──────────────────────────────────────────────────────────────────────
+# ─── Main (uso local) ──────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("\n" + "="*55)
-    print("  🚀  BI Dashboard — MDN Porto Rico (Manutenção)")
-    print("="*55)
-    print("  💻  Computador : http://localhost:5000")
-    try:
-        ip = socket.gethostbyname(socket.gethostname())
-        print(f"  📱  Celular     : http://{ip}:5000  (mesmo Wi-Fi)")
-    except Exception:
-        pass
-    print("  ⏳  Carregando dados dos pipes em background...")
-    print("      Porto Rico + Zeladoria (~4.500 cards)")
-    print("="*55 + "\n")
-    for pk in PIPES:
-        threading.Thread(target=bg_loop, args=(pk,), daemon=True).start()
+    print("\n  BI Dashboard - MDN Porto Rico")
+    print("  http://localhost:5000/pipefy")
+    print("  Os cards carregam em pedacos conforme a pagina faz polling.\n")
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)

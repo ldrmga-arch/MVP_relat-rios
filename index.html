@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dashboards — MDN / Aruna</title>
+<style>
+  :root{--bg:#0f172a;--sf:#1e293b;--sf2:#334155;--tx:#f1f5f9;--mu:#94a3b8;--pr:#6366f1;}
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{background:var(--bg);color:var(--tx);font-family:system-ui,-apple-system,sans-serif;
+       min-height:100vh;display:flex;align-items:center;justify-content:center;}
+  .wrap{max-width:560px;padding:24px;width:100%;}
+  h1{font-size:1.4rem;margin-bottom:24px;text-align:center;}
+  .cards{display:grid;gap:16px;}
+  a.card{display:block;background:var(--sf);border:1px solid var(--sf2);border-radius:14px;
+         padding:22px;text-decoration:none;color:var(--tx);transition:border-color .15s;}
+  a.card:hover{border-color:var(--pr);}
+  a.card .ttl{font-size:1.1rem;font-weight:600;margin-bottom:6px;}
+  a.card .sub{font-size:.85rem;color:var(--mu);}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>📊 Dashboards Operacionais</h1>
+  <div class="cards">
+    <a class="card" href="/pipefy">
+      <div class="ttl">Dashboard Pipefy</div>
+      <div class="sub">Manutenção, Zeladoria, Atendimento e pipes da Aruna Ilhas</div>
+    </a>
+    <a class="card" href="/omie">
+      <div class="ttl">Dashboard Financeiro — Omie</div>
+      <div class="sub">Contas a pagar, a receber e saldo de caixa</div>
+    </a>
+  </div>
+</div>
+</body>
+</html>
