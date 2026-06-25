@@ -248,14 +248,22 @@ query($phaseId: ID!, $after: String) {
 """
 
 def get_token():
+    if not CLIENT_ID or not CLIENT_SECRET:
+        raise RuntimeError(
+            "PIPEFY_CLIENT_ID/PIPEFY_CLIENT_SECRET (ou CLIENT_ID/CLIENT_SECRET) "
+            "não estão definidos nas variáveis de ambiente.")
     data = urllib.parse.urlencode({
         "grant_type": "client_credentials",
         "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET,
     }).encode()
     req = urllib.request.Request(TOKEN_URL, data=data, method="POST")
     req.add_header("Content-Type", "application/x-www-form-urlencoded")
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read())["access_token"]
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())["access_token"]
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        raise RuntimeError(f"Pipefy token {e.code}: {body}") from e
 
 def gql(token, query, variables=None, retries=3):
     body = json.dumps({"query": query, "variables": variables or {}}).encode()
