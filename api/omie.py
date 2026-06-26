@@ -237,10 +237,14 @@ def index():
 
 @app.route("/omie/api/data")
 def api_data():
-    st = load_state()
-    if st["loading"] or not st["last_updated"]:
-        st = process_chunk()
-    return jsonify(public_view(st))
+    try:
+        st = load_state()
+        if st["loading"] or not st["last_updated"]:
+            st = process_chunk()
+        return jsonify(public_view(st))
+    except Exception as ex:
+        import traceback
+        return jsonify({"debug_error": str(ex), "debug_trace": traceback.format_exc()}), 500
 
 @app.route("/omie/api/refresh", methods=["POST"])
 def api_refresh():
