@@ -10,7 +10,7 @@ from datetime import datetime, date
 from flask import Flask, jsonify, Response, request
 import requests
 from dotenv import load_dotenv
-from _cache import redis_get, redis_set, CHUNK_SECONDS
+
 
 load_dotenv()
 
@@ -27,6 +27,27 @@ ENDPOINTS = {
 }
 
 app = Flask(__name__)
+
+# ─── Cache externo (Upstash Redis REST) ───────────────────────────────────────
+REDIS_URL   = os.environ.get("KV_REST_API_URL")   or os.environ.get("UPSTASH_REDIS_REST_URL")
+REDIS_TOKEN = os.environ.get("KV_REST_API_TOKEN") or os.environ.get("UPSTASH_REDIS_REST_TOKEN")
+CHUNK_SECONDS = 8  # margem de segurança sob o timeout de 10s do plano free da Vercel
+
+def redis_get(key):
+    if not REDIS_URL:
+        return None
+    r = requests.get(f"{REDIS_URL}/get/{key}",
+                      headers={"Authorization": f"Bearer {REDIS_TOKEN}"}, timeout=10)
+    r.raise_for_status()
+    val = r.json().get("result")
+    return json.loads(val) if val else None
+
+def redis_set(key, value):
+    if not REDIS_URL:
+        return
+    requests.post(f"{REDIS_URL}/set/{key}",
+                  headers={"Authorization": f"Bearer {REDIS_TOKEN}"},
+                  data=json.dumps(value), timeout=10)
 
 # ─── Estado (persistido no Redis entre invocações) ────────────────────────────
 STEPS = ["pessoas", "pagar", "receber", "saldo"]
@@ -237,14 +258,10 @@ def index():
 
 @app.route("/omie/api/data")
 def api_data():
-    try:
-        st = load_state()
-        if st["loading"] or not st["last_updated"]:
-            st = process_chunk()
-        return jsonify(public_view(st))
-    except Exception as ex:
-        import traceback
-        return jsonify({"debug_error": str(ex), "debug_trace": traceback.format_exc()}), 500
+    st = load_state()
+    if st["loading"] or not st["last_updated"]:
+        st = process_chunk()
+    return jsonify(public_view(st))
 
 @app.route("/omie/api/refresh", methods=["POST"])
 def api_refresh():
