@@ -74,32 +74,24 @@ def public_view(st):
     return {k: v for k, v in st.items() if not k.startswith("_")}
 
 # ─── Chamada genérica à API Omie ────────────────────────────────────────────────
-def omie_call(endpoint, call, param, retries=4):
+def omie_call(endpoint, call, param):
+    """Uma tentativa, sem sleeps longos: numa função serverless com orçamento
+    de poucos segundos por chunk, um retry com espera (ex: 31s no rate limit
+    "chamada redundante" da Omie) sozinho já estoura o timeout. Em caso de
+    falha, deixa o erro subir; o próximo poll do frontend tenta de novo depois
+    de alguns segundos, o que já espaça as chamadas o suficiente."""
     payload = {
         "call": call,
         "app_key": APP_KEY,
         "app_secret": APP_SECRET,
         "param": [param],
     }
-    last_err = None
-    for attempt in range(1, retries + 1):
-        try:
-            r = requests.post(OMIE_BASE + endpoint, json=payload, timeout=60)
-            data = r.json()
-        except requests.exceptions.RequestException as e:
-            last_err = e
-            time.sleep(5)
-            continue
-        if "faultstring" in data:
-            if "REDUNDANT" in data.get("faultcode", "") or "redundante" in data["faultstring"].lower():
-                time.sleep(31)
-                last_err = RuntimeError(data["faultstring"])
-                continue
-            raise RuntimeError(data["faultstring"])
-        r.raise_for_status()
-        time.sleep(0.3)
-        return data
-    raise last_err
+    r = requests.post(OMIE_BASE + endpoint, json=payload, timeout=8)
+    data = r.json()
+    if "faultstring" in data:
+        raise RuntimeError(data["faultstring"])
+    r.raise_for_status()
+    return data
 
 MESES_PASSADO = 12
 MESES_FUTURO  = 3
