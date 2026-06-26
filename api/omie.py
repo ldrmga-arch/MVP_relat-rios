@@ -10,6 +10,7 @@ from datetime import datetime, date
 from flask import Flask, jsonify, Response, request
 import requests
 from dotenv import load_dotenv
+from _cache import redis_get, redis_set, CHUNK_SECONDS
 
 load_dotenv()
 
@@ -27,16 +28,29 @@ ENDPOINTS = {
 
 app = Flask(__name__)
 
-# ─── Estado global ──────────────────────────────────────────────────────────────
-state = {
-    "contas_pagar": [],
-    "contas_receber": [],
-    "saldo_caixa": 0.0,
-    "loading": False,
-    "last_updated": None,
-    "error": None,
-    "mock": USE_MOCK,
-}
+# ─── Estado (persistido no Redis entre invocações) ────────────────────────────
+STEPS = ["pessoas", "pagar", "receber", "saldo"]
+
+def empty_state():
+    return {
+        "contas_pagar": [], "contas_receber": [], "saldo_caixa": 0.0,
+        "loading": False, "last_updated": None, "error": None, "mock": USE_MOCK,
+        "_step_idx": 0, "_page": 1,
+        "_partial_pessoas": {}, "_partial_pagar": [], "_partial_receber": [],
+        "_accounts": None, "_account_idx": 0, "_saldo_acc": 0.0,
+    }
+
+def state_key():
+    return "omie:state"
+
+def load_state():
+    return redis_get(state_key()) or empty_state()
+
+def save_state(st):
+    redis_set(state_key(), st)
+
+def public_view(st):
+    return {k: v for k, v in st.items() if not k.startswith("_")}
 
 # ─── Chamada genérica à API Omie ────────────────────────────────────────────────
 def omie_call(endpoint, call, param, retries=4):
@@ -81,72 +95,50 @@ def periodo_filtro():
     ate = date(ano_ate, mes_ate, 1)
     return de.strftime("%d/%m/%Y"), ate.strftime("%d/%m/%Y")
 
-def load_contas_pagar():
+def load_contas_pagar_page(pagina):
+    """Retorna (registros_da_pagina, total_de_paginas)."""
     de, ate = periodo_filtro()
-    resultado, pagina = [], 1
-    while True:
-        data = omie_call(ENDPOINTS["contas_pagar"], "ListarContasPagar", {
-            "pagina": pagina, "registros_por_pagina": 200,
-            "filtrar_por_data_de": de, "filtrar_por_data_ate": ate,
-        })
-        resultado += data.get("conta_pagar_cadastro", [])
-        if pagina >= data.get("total_de_paginas", 1):
-            break
-        pagina += 1
-    return resultado
+    data = omie_call(ENDPOINTS["contas_pagar"], "ListarContasPagar", {
+        "pagina": pagina, "registros_por_pagina": 200,
+        "filtrar_por_data_de": de, "filtrar_por_data_ate": ate,
+    })
+    return data.get("conta_pagar_cadastro", []), data.get("total_de_paginas", 1)
 
-def load_contas_receber():
+def load_contas_receber_page(pagina):
     de, ate = periodo_filtro()
-    resultado, pagina = [], 1
-    while True:
-        data = omie_call(ENDPOINTS["contas_receber"], "ListarContasReceber", {
-            "pagina": pagina, "registros_por_pagina": 200,
-            "filtrar_por_data_de": de, "filtrar_por_data_ate": ate,
-        })
-        resultado += data.get("conta_receber_cadastro", [])
-        if pagina >= data.get("total_de_paginas", 1):
-            break
-        pagina += 1
-    return resultado
+    data = omie_call(ENDPOINTS["contas_receber"], "ListarContasReceber", {
+        "pagina": pagina, "registros_por_pagina": 200,
+        "filtrar_por_data_de": de, "filtrar_por_data_ate": ate,
+    })
+    return data.get("conta_receber_cadastro", []), data.get("total_de_paginas", 1)
 
-PESSOAS_CACHE = {}
+def load_pessoas_page(pagina):
+    """Cadastro unificado de clientes/fornecedores (codigo -> razão social)."""
+    data = omie_call("/geral/clientes/", "ListarClientes",
+                      {"pagina": pagina, "registros_por_pagina": 200})
+    pessoas = {str(c["codigo_cliente_omie"]): c.get("razao_social") or c.get("nome_fantasia") or ""
+               for c in data.get("clientes_cadastro", [])}
+    return pessoas, data.get("total_de_paginas", 1)
 
-def load_pessoas():
-    """Carrega o cadastro unificado de clientes/fornecedores (codigo -> razão social)."""
-    cache, pagina = {}, 1
-    while True:
-        data = omie_call("/geral/clientes/", "ListarClientes",
-                          {"pagina": pagina, "registros_por_pagina": 200})
-        for c in data.get("clientes_cadastro", []):
-            cache[c["codigo_cliente_omie"]] = c.get("razao_social") or c.get("nome_fantasia") or ""
-        if pagina >= data.get("total_de_paginas", 1):
-            break
-        pagina += 1
-    return cache
-
-def nome_pessoa(codigo):
-    return PESSOAS_CACHE.get(codigo, f"Cód. {codigo}")
-
-def enriquecer(registros, campo_codigo, campo_nome):
+def enriquecer(registros, campo_codigo, campo_nome, pessoas):
     for r in registros:
-        r[campo_nome] = nome_pessoa(r.get(campo_codigo))
+        cod = str(r.get(campo_codigo))
+        r[campo_nome] = pessoas.get(cod, f"Cód. {cod}")
     return registros
 
-def load_saldo_caixa():
-    contas = omie_call("/geral/contacorrente/", "ListarContasCorrentes",
-                        {"pagina": 1, "registros_por_pagina": 100})
+def load_contas_correntes():
+    data = omie_call("/geral/contacorrente/", "ListarContasCorrentes",
+                      {"pagina": 1, "registros_por_pagina": 100})
+    return [c for c in data.get("ListarContasCorrentes", []) if c.get("inativo") != "S"]
+
+def load_saldo_conta(conta):
     hoje = date.today().strftime("%d/%m/%Y")
-    total = 0.0
-    for conta in contas.get("ListarContasCorrentes", []):
-        if conta.get("inativo") == "S":
-            continue
-        extrato = omie_call(ENDPOINTS["extrato"], "ListarExtrato", {
-            "nCodCC": conta["nCodCC"],
-            "dPeriodoInicial": conta.get("saldo_data", "01/01/2000"),
-            "dPeriodoFinal": hoje,
-        })
-        total += extrato.get("nSaldoAtual", 0.0)
-    return total
+    extrato = omie_call(ENDPOINTS["extrato"], "ListarExtrato", {
+        "nCodCC": conta["nCodCC"],
+        "dPeriodoInicial": conta.get("saldo_data", "01/01/2000"),
+        "dPeriodoFinal": hoje,
+    })
+    return extrato.get("nSaldoAtual", 0.0)
 
 # ─── Dados mock (sem credenciais Omie) ──────────────────────────────────────────
 def mock_data():
@@ -168,40 +160,75 @@ def mock_data():
             })
     return contas_pagar, contas_receber, 18540.32
 
-def refresh():
-    state["loading"] = True
-    state["error"] = None
-    errors = []
+def process_chunk():
+    """Avança o carregamento por um tempo limitado (CHUNK_SECONDS) e persiste o
+    progresso no Redis. Repetidamente chamado pelo polling do frontend até
+    completar todos os passos (pessoas -> pagar -> receber -> saldo)."""
+    st = load_state()
+
+    if USE_MOCK:
+        cp, cr, saldo = mock_data()
+        st = empty_state()
+        st["contas_pagar"], st["contas_receber"], st["saldo_caixa"] = cp, cr, saldo
+        st["last_updated"] = datetime.now().isoformat()
+        save_state(st)
+        return st
+
+    if not st["loading"]:
+        st = empty_state()
+        st["loading"] = True
+
+    deadline = time.time() + CHUNK_SECONDS
     try:
-        if USE_MOCK:
-            cp, cr, saldo = mock_data()
-        else:
-            if not PESSOAS_CACHE:
-                try:
-                    PESSOAS_CACHE.update(load_pessoas())
-                except Exception as e:
-                    errors.append(f"cadastro de clientes/fornecedores: {e}")
-            try:
-                cp = enriquecer(load_contas_pagar(), "codigo_cliente_fornecedor", "fornecedor")
-            except Exception as e:
-                cp = []; errors.append(f"contas a pagar: {e}")
-            try:
-                cr = enriquecer(load_contas_receber(), "codigo_cliente_fornecedor", "cliente")
-            except Exception as e:
-                cr = []; errors.append(f"contas a receber: {e}")
-            try:
-                saldo = load_saldo_caixa()
-            except Exception as e:
-                saldo = 0.0; errors.append(f"saldo de caixa: {e}")
-        state["contas_pagar"]   = cp
-        state["contas_receber"] = cr
-        state["saldo_caixa"]    = saldo
-        state["last_updated"]   = datetime.now().isoformat()
-        state["error"] = " | ".join(errors) if errors else None
-    except Exception as e:
-        state["error"] = str(e)
-    finally:
-        state["loading"] = False
+        while time.time() < deadline and st["_step_idx"] < len(STEPS):
+            step = STEPS[st["_step_idx"]]
+
+            if step == "pessoas":
+                pessoas, total_paginas = load_pessoas_page(st["_page"])
+                st["_partial_pessoas"].update(pessoas)
+            elif step == "pagar":
+                registros, total_paginas = load_contas_pagar_page(st["_page"])
+                st["_partial_pagar"] += registros
+            elif step == "receber":
+                registros, total_paginas = load_contas_receber_page(st["_page"])
+                st["_partial_receber"] += registros
+            else:  # saldo
+                if st["_accounts"] is None:
+                    st["_accounts"] = load_contas_correntes()
+                    st["_account_idx"] = 0
+                    st["_saldo_acc"] = 0.0
+                if st["_account_idx"] >= len(st["_accounts"]):
+                    st["_step_idx"] += 1
+                    continue
+                conta = st["_accounts"][st["_account_idx"]]
+                st["_saldo_acc"] += load_saldo_conta(conta)
+                st["_account_idx"] += 1
+                continue
+
+            if st["_page"] >= total_paginas:
+                st["_step_idx"] += 1
+                st["_page"] = 1
+            else:
+                st["_page"] += 1
+
+        if st["_step_idx"] >= len(STEPS):
+            pessoas = st["_partial_pessoas"]
+            st["contas_pagar"]   = enriquecer(st["_partial_pagar"],   "codigo_cliente_fornecedor", "fornecedor", pessoas)
+            st["contas_receber"] = enriquecer(st["_partial_receber"], "codigo_cliente_fornecedor", "cliente",    pessoas)
+            st["saldo_caixa"]    = st["_saldo_acc"]
+            st["last_updated"]   = datetime.now().isoformat()
+            st["loading"]        = False
+            st["error"]          = None
+            st["_step_idx"], st["_page"]           = 0, 1
+            st["_partial_pessoas"]                 = {}
+            st["_partial_pagar"], st["_partial_receber"] = [], []
+            st["_accounts"], st["_account_idx"], st["_saldo_acc"] = None, 0, 0.0
+    except Exception as ex:
+        st["error"]   = str(ex)
+        st["loading"] = False
+
+    save_state(st)
+    return st
 
 # ─── Rotas ───────────────────────────────────────────────────────────────────
 @app.route("/omie")
@@ -210,12 +237,17 @@ def index():
 
 @app.route("/omie/api/data")
 def api_data():
-    refresh()
-    return jsonify(state)
+    st = load_state()
+    if st["loading"] or not st["last_updated"]:
+        st = process_chunk()
+    return jsonify(public_view(st))
 
 @app.route("/omie/api/refresh", methods=["POST"])
 def api_refresh():
-    refresh()
+    st = empty_state()
+    st["loading"] = True
+    save_state(st)
+    process_chunk()
     return jsonify({"ok": True})
 
 # ─── HTML Dashboard ──────────────────────────────────────────────────────────
@@ -462,15 +494,27 @@ async function load(){
   const r = await fetch('/omie/api/data');
   raw = await r.json();
   document.getElementById('mockBadge').style.display = raw.mock ? 'inline-block' : 'none';
-  document.getElementById('lastUpdated').textContent = raw.last_updated ? `Última atualização: ${new Date(raw.last_updated).toLocaleString('pt-BR')}` : '';
-  fillMesFiltro();
-  render();
+  if(raw.error && !raw.loading){
+    document.getElementById('lastUpdated').textContent = '⚠ Erro: '+raw.error.slice(0,80);
+  } else if(raw.loading){
+    document.getElementById('lastUpdated').textContent = 'Carregando…';
+  } else if(raw.last_updated){
+    document.getElementById('lastUpdated').textContent = `Última atualização: ${new Date(raw.last_updated).toLocaleString('pt-BR')}`;
+  }
+  if(!raw.loading){
+    fillMesFiltro();
+    render();
+  }
+  return raw.loading;
 }
 
 async function refreshData(){ await load(); }
 
-load();
-setInterval(load, 60000);
+async function poll(){
+  const stillLoading = await load();
+  setTimeout(poll, stillLoading ? 800 : 60000);
+}
+poll();
 </script>
 </body>
 </html>
