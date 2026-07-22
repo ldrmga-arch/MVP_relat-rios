@@ -1,7 +1,5 @@
 {
   "rewrites": [
-    { "source": "/pipefy",       "destination": "/api/pipefy" },
-    { "source": "/pipefy/:path*","destination": "/api/pipefy" },
     { "source": "/omie",         "destination": "/api/omie" },
     { "source": "/omie/:path*",  "destination": "/api/omie" },
     { "source": "/faturas",      "destination": "/api/faturas" },
@@ -14,7 +12,6 @@
     { "source": "/cotistas/:path*","destination": "/api/cotistas" }
   ],
   "functions": {
-    "api/pipefy.py":    { "maxDuration": 10 },
     "api/omie.py":      { "maxDuration": 10 },
     "api/faturas.py":   { "maxDuration": 60 },
     "api/relatorios.py":{ "maxDuration": 60 },
