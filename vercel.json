@@ -1,9 +1,1 @@
-{
-  "rewrites": [
-    { "source": "/omie",         "destination": "/api/omie" },
-    { "source": "/omie/:path*",  "destination": "/api/omie" }
-  ],
-  "functions": {
-    "api/omie.py":      { "maxDuration": 10 }
-  }
-}
+{}
