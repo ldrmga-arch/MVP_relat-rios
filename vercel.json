@@ -1,21 +1,9 @@
 {
   "rewrites": [
     { "source": "/omie",         "destination": "/api/omie" },
-    { "source": "/omie/:path*",  "destination": "/api/omie" },
-    { "source": "/faturas",      "destination": "/api/faturas" },
-    { "source": "/faturas/:path*","destination": "/api/faturas" },
-    { "source": "/relatorios",   "destination": "/api/relatorios" },
-    { "source": "/relatorios/:path*","destination": "/api/relatorios" },
-    { "source": "/zeladoria",    "destination": "/api/zeladoria" },
-    { "source": "/zeladoria/:path*","destination": "/api/zeladoria" },
-    { "source": "/cotistas",     "destination": "/api/cotistas" },
-    { "source": "/cotistas/:path*","destination": "/api/cotistas" }
+    { "source": "/omie/:path*",  "destination": "/api/omie" }
   ],
   "functions": {
-    "api/omie.py":      { "maxDuration": 10 },
-    "api/faturas.py":   { "maxDuration": 60 },
-    "api/relatorios.py":{ "maxDuration": 60 },
-    "api/zeladoria.py": { "maxDuration": 30 },
-    "api/cotistas.py":  { "maxDuration": 30 }
+    "api/omie.py":      { "maxDuration": 10 }
   }
 }
